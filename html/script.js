@@ -194,10 +194,10 @@ function renderOrders() {
     let instHtml = '';
     (o.installments || []).forEach(i => {
       const due = new Date(i.due_at).toLocaleString();
-      instHtml += `<div class="muted">#${i.id} • $${i.amount} • Due ${due} • ${i.paid ? 'Paid' : '<button data-id="'+i.id+'" class="primary">Pay</button>'}</div>`;
+      instHtml += `<div class="muted">#${i.id} â€¢ $${i.amount} â€¢ Due ${due} â€¢ ${i.paid ? 'Paid' : '<button data-id="'+i.id+'" class="primary">Pay</button>'}</div>`;
     });
     li.innerHTML = `<div>
-      <div><strong>${o.shop_id}</strong> • $${o.total} • ${o.status}</div>
+      <div><strong>${o.shop_id}</strong> â€¢ $${o.total} â€¢ ${o.status}</div>
       ${instHtml}
     </div>`;
     ordersList.appendChild(li);
@@ -236,6 +236,8 @@ if (saveItemBtn){
 
 function renderStaff() {
   if (!state.staff) return;
+  staffHydratePlansForCO();
+
   staffCatalog.innerHTML = '';
   state.catalog.forEach(it => {
     const li = document.createElement('li');
@@ -259,6 +261,71 @@ function renderStaff() {
 }
 
 function notify(msg){ console.log('[Afterpay]', msg); }
+
+// ---- Merchant Create Order (staff) ----
+const coTarget = document.getElementById('coTarget');
+const coItems = document.getElementById('coItems');
+const coAddItem = document.getElementById('coAddItem');
+const coPlan = document.getElementById('coPlan');
+const coCreate = document.getElementById('coCreate');
+
+function staffHydratePlansForCO(){
+  if (!coPlan) return;
+  coPlan.innerHTML = '';
+  (state.plans || []).forEach(p => {
+    const o = document.createElement('option');
+    o.value = p.id; o.textContent = p.label;
+    coPlan.appendChild(o);
+  });
+}
+
+function coAddLine(initial){
+  const row = document.createElement('div');
+  row.style = 'display:flex; gap:6px; align-items:center; margin:6px 0;';
+  row.innerHTML = `
+    <input placeholder="Name (inventory or custom)" style="flex:2">
+    <input placeholder="Label" style="flex:2">
+    <input type="number" placeholder="Price" style="width:120px">
+    <input type="number" placeholder="Qty" value="1" style="width:80px">
+    <button class="ghost remove">x</button>
+  `;
+  row.querySelector('.remove').addEventListener('click', ()=> row.remove());
+  if (initial) {
+    row.children[0].value = initial.name || '';
+    row.children[1].value = initial.label || '';
+    row.children[2].value = initial.price || 0;
+    row.children[3].value = initial.qty || 1;
+  }
+  coItems.appendChild(row);
+}
+
+if (coAddItem) coAddItem.addEventListener('click', ()=> coAddLine());
+
+if (coCreate){
+  coCreate.addEventListener('click', () => {
+    const target = parseInt(coTarget.value || '0');
+    if (!target) return notify('Enter customer server id');
+    const plan_id = coPlan.value;
+    const items = [];
+    coItems.querySelectorAll('div').forEach(row => {
+      const inputs = row.querySelectorAll('input');
+      const name = inputs[0].value.trim();
+      const label = inputs[1].value.trim();
+      const price = parseInt(inputs[2].value || '0');
+      const qty = parseInt(inputs[3].value || '1');
+      if (label && price > 0 && qty > 0) items.push({ name, label, price, qty });
+    });
+    if (items.length === 0) return notify('Add at least one line item');
+
+    nuiPost('staff:merchant:createOrder', {
+      target_src: target,
+      shop_id: staffShop.value,
+      plan_id,
+      items
+    });
+    setTimeout(loadOrders, 600);
+  });
+}
 
 window.addEventListener('message', (e) => {
   const data = e.data || {};
