@@ -13,9 +13,9 @@
       <div class="header">
         <div class="brand">
           <span class="logo">afterpay</span>
-          <span class="glyph">➟</span>
+          <span class="glyph">âžŸ</span>
         </div>
-        <button id="closeBtn" class="close">×</button>
+        <button id="closeBtn" class="close">Ã—</button>
       </div>
 
       <div class="nav">
@@ -58,13 +58,28 @@
               <input id="itemName" placeholder="item name (inventory)">
               <input id="itemLabel" placeholder="Label">
               <input id="itemPrice" type="number" placeholder="Price">
-              <input id="itemImage" placeholder="Image URL (optional, supports nui://qb-inventory/html/images/*.png)">
+              <input id="itemImage" placeholder="Image URL (nui://qb-inventory/html/images/*.png)">
               <button id="saveItemBtn" class="primary">Save Item</button>
             </div>
+
             <div class="card">
               <h3>Catalog</h3>
               <ul id="staffCatalog" class="list"></ul>
             </div>
+
+            <div class="card" style="grid-column: span 2;">
+              <h3>Create Customer Order</h3>
+              <div class="muted">Enter customer server id, add line items, choose plan, then Create.</div>
+              <input id="coTarget" type="number" placeholder="Customer server id (nearby)">
+              <div id="coItems"></div>
+              <button id="coAddItem" class="ghost">+ Add Line Item</button>
+              <div style="display:flex; gap:8px; align-items:center; margin-top:8px;">
+                <label>Plan</label>
+                <select id="coPlan"></select>
+                <button id="coCreate" class="primary" style="margin-left:auto;">Create Order</button>
+              </div>
+            </div>
+
           </div>
         </div>
       </div>
@@ -74,7 +89,7 @@
       <div class="drawer-panel">
         <div class="drawer-header">
           <h3>Cart</h3>
-          <button id="closeCart" class="close">×</button>
+          <button id="closeCart" class="close">Ã—</button>
         </div>
         <ul id="cartList" class="list"></ul>
         <div class="drawer-footer">
