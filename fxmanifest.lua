@@ -2,8 +2,8 @@ fx_version 'cerulean'
 game 'gta5'
 
 author 'Braiden Marshall'
-description 'IRL-style Afterpay BNPL for QBCore with anchored billing days'
-version '1.1.0'
+description 'Afterpay-style BNPL for QBCore: anchored billing, fuel checkout, offline charging/late fees, merchant payouts.'
+version '2.0.0'
 
 lua54 'yes'
 
