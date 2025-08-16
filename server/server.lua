@@ -4,9 +4,7 @@ local function debug(msg)
     if Config.Debug then print(('[qb-afterpay] %s'):format(msg)) end
 end
 
--- =========================
--- Access helpers
--- =========================
+-- ===== Access helpers =====
 local function PlayerHasShopAccess(src, shopId)
     local Player = QBCore.Functions.GetPlayer(src)
     if not Player then return false end
@@ -20,24 +18,19 @@ local function PlayerHasShopAccess(src, shopId)
     return false
 end
 
--- =========================
--- Anchored billing helpers
--- =========================
+-- ===== Anchored billing helpers =====
 local function atTime(y, m, d, hour, min)
     return os.time({year = y, month = m, day = d, hour = hour or 9, min = min or 0, sec = 0})
 end
 
 local function nextWeekdayAnchor(fromTs)
     local t = os.date('*t', fromTs)
-    local target = (Config.Billing and Config.Billing.weekday) or 2 -- default Monday
+    local target = (Config.Billing and Config.Billing.weekday) or 2
     local h = Config.Billing and Config.Billing.charge_time and Config.Billing.charge_time.hour or 9
     local m = Config.Billing and Config.Billing.charge_time and Config.Billing.charge_time.min or 0
-
     local delta = (target - t.wday) % 7
     local candidate = atTime(t.year, t.month, t.day + delta, h, m)
-    if candidate <= fromTs then
-        candidate = atTime(t.year, t.month, t.day + delta + 7, h, m)
-    end
+    if candidate <= fromTs then candidate = atTime(t.year, t.month, t.day + delta + 7, h, m) end
     return candidate
 end
 
@@ -47,14 +40,9 @@ local function nextMonthDayAnchor(fromTs)
     table.sort(days)
     local h = Config.Billing and Config.Billing.charge_time and Config.Billing.charge_time.hour or 9
     local m = Config.Billing and Config.Billing.charge_time and Config.Billing.charge_time.min or 0
-
     for _, d in ipairs(days) do
-        local ok, candidate = pcall(function()
-            return atTime(t.year, t.month, d, h, m)
-        end)
-        if ok and candidate and candidate > fromTs then
-            return candidate
-        end
+        local ok, candidate = pcall(function() return atTime(t.year, t.month, d, h, m) end)
+        if ok and candidate and candidate > fromTs then return candidate end
     end
     local year, month = t.year, t.month + 1
     if month == 13 then month = 1; year = year + 1 end
@@ -62,20 +50,13 @@ local function nextMonthDayAnchor(fromTs)
 end
 
 local function nextAnchor(fromTs)
-    if not Config.Billing or not Config.Billing.mode then
-        return fromTs
-    end
-    if Config.Billing.mode == 'WEEKDAY' then
-        return nextWeekdayAnchor(fromTs)
-    elseif Config.Billing.mode == 'MONTH_DAYS' then
-        return nextMonthDayAnchor(fromTs)
-    end
+    if not Config.Billing or not Config.Billing.mode then return fromTs end
+    if Config.Billing.mode == 'WEEKDAY' then return nextWeekdayAnchor(fromTs)
+    elseif Config.Billing.mode == 'MONTH_DAYS' then return nextMonthDayAnchor(fromTs) end
     return fromTs
 end
 
--- =========================
--- Callbacks for NUI
--- =========================
+-- ===== NUI callbacks =====
 QBCore.Functions.CreateCallback('qb-afterpay:server:getShops', function(_, cb)
     cb(Config.Shops)
 end)
@@ -103,9 +84,7 @@ QBCore.Functions.CreateCallback('qb-afterpay:server:getOrders', function(src, cb
     end)
 end)
 
--- =========================
--- Payment helpers
--- =========================
+-- ===== Payment helpers =====
 local function TryCharge(src, Player, amount)
     for _,account in ipairs(Config.Accounts) do
         if Player.Functions.RemoveMoney(account, amount, 'afterpay-installment') then
@@ -116,9 +95,43 @@ local function TryCharge(src, Player, amount)
     return false
 end
 
--- =========================
--- Checkout (creates order + installments on anchors)
--- =========================
+-- ===== Merchant helpers =====
+local function MerchantForShop(shop_id)
+    if not Config.Merchant or not Config.Merchant.Enabled then return nil end
+    return (Config.ShopBusinesses or {})[shop_id]
+end
+
+local function RecordMerchantPayout(shop_id, order_id, installment_id, gross, fee, net)
+    MySQL.insert.await(
+        'INSERT INTO afterpay_merchant_payouts (shop_id, order_id, installment_id, gross, fee, net) VALUES (?, ?, ?, ?, ?, ?)',
+        { shop_id, order_id, installment_id, gross, fee, net }
+    )
+end
+
+local function PayBusiness(shop_id, amount, order_id, installment_id)
+    local job = MerchantForShop(shop_id)
+    if not job or amount <= 0 then return end
+
+    local fee = math.floor((amount * (Config.Merchant.FeePercent or 0)) / 100 + 0.5)
+    local net = amount - fee
+    if net < 0 then net = 0 end
+
+    if Config.Merchant.UseQBManagement and GetResourceState('qb-management') == 'started' then
+        exports['qb-management']:AddMoney(job, net)
+    else
+        for _, src in pairs(QBCore.Functions.GetPlayers()) do
+            local P = QBCore.Functions.GetPlayer(src)
+            if P and P.PlayerData.job and P.PlayerData.job.name == job then
+                P.Functions.AddMoney('bank', net, 'afterpay-merchant-payout')
+                break
+            end
+        end
+    end
+
+    RecordMerchantPayout(shop_id, order_id, installment_id, amount, fee, net)
+end
+
+-- ===== Checkout (player self-checkout) =====
 RegisterNetEvent('qb-afterpay:server:checkout', function(data)
     local src = source
     local Player = QBCore.Functions.GetPlayer(src)
@@ -129,90 +142,58 @@ RegisterNetEvent('qb-afterpay:server:checkout', function(data)
     local planId = data.plan_id
 
     if not shopId or not planId or #items == 0 then
-        TriggerClientEvent('qb-afterpay:client:notify', src, 'Invalid checkout data', 'error')
-        return
+        TriggerClientEvent('qb-afterpay:client:notify', src, 'Invalid checkout data', 'error'); return
     end
 
-    local plan
-    for _,p in ipairs(Config.Plans) do
-        if p.id == planId then plan = p break end
-    end
-    if not plan then
-        TriggerClientEvent('qb-afterpay:client:notify', src, 'Unknown plan', 'error')
-        return
-    end
+    local plan; for _,p in ipairs(Config.Plans) do if p.id == planId then plan = p break end end
+    if not plan then TriggerClientEvent('qb-afterpay:client:notify', src, 'Unknown plan', 'error'); return end
 
     local total = 0
-    for _,it in ipairs(items) do
-        local price = tonumber(it.price) or 0
-        local qty = tonumber(it.qty) or 1
-        total = total + (price * qty)
-    end
+    for _,it in ipairs(items) do total = total + (tonumber(it.price) or 0) * (tonumber(it.qty) or 1) end
     total = math.floor(total + 0.5)
 
-    local orderId = MySQL.insert.await('INSERT INTO afterpay_orders (citizenid, shop_id, plan_id, total, status) VALUES (?, ?, ?, ?, ?)',
-        { Player.PlayerData.citizenid, shopId, planId, total, 'active' })
-    if not orderId then
-        TriggerClientEvent('qb-afterpay:client:notify', src, 'Failed to create order', 'error')
-        return
-    end
+    local orderId = MySQL.insert.await('INSERT INTO afterpay_orders (citizenid, shop_id, plan_id, total, status) VALUES (?, ?, ?, ?, ?)', {
+        Player.PlayerData.citizenid, shopId, planId, total, 'active'
+    })
+    if not orderId then TriggerClientEvent('qb-afterpay:client:notify', src, 'Failed to create order', 'error'); return end
 
     for _,it in ipairs(items) do
         local qty = tonumber(it.qty) or 1
-        MySQL.insert('INSERT INTO afterpay_order_items (order_id, item_name, label, price, qty) VALUES (?, ?, ?, ?, ?)', {
+        MySQL.insert.await('INSERT INTO afterpay_order_items (order_id, item_name, label, price, qty) VALUES (?, ?, ?, ?, ?)', {
             orderId, it.name, it.label, it.price, qty
         })
     end
 
-    -- Create installments aligned to anchors
     local per = math.floor((total / plan.parts) + 0.5)
     local remaining = total
     local now = os.time()
     local dueList = {}
-
-    local firstDue
-    if Config.Billing and Config.Billing.first_at_checkout == false then
-        firstDue = nextAnchor(now)
-    else
-        firstDue = now
-    end
+    local firstDue = (Config.Billing and Config.Billing.first_at_checkout == false) and nextAnchor(now) or now
 
     for idx = 1, plan.parts do
         local amount = (idx == plan.parts) and remaining or per
         remaining = remaining - amount
-
-        local dueAt
-        if idx == 1 then
-            dueAt = firstDue
-        else
-            local prev = dueList[#dueList] or firstDue
-            dueAt = nextAnchor(prev + 60)
-        end
-
-        if idx == 1 and firstDue == now then
-            dueAt = now
-        end
-
-        local id = MySQL.insert.await(
-            'INSERT INTO afterpay_installments (order_id, due_at, amount, paid) VALUES (?, FROM_UNIXTIME(?), ?, 0)',
-            { orderId, dueAt, amount }
-        )
+        local dueAt = (idx == 1) and firstDue or nextAnchor((dueList[#dueList] or firstDue) + 60)
+        MySQL.insert.await('INSERT INTO afterpay_installments (order_id, due_at, amount, paid) VALUES (?, FROM_UNIXTIME(?), ?, 0)', {
+            orderId, dueAt, amount
+        })
         table.insert(dueList, dueAt)
     end
 
-    -- If taking first at checkout, try to charge immediately
     if not (Config.Billing and Config.Billing.first_at_checkout == false) then
         local firstRow = MySQL.single.await('SELECT * FROM afterpay_installments WHERE order_id = ? ORDER BY due_at ASC LIMIT 1', {orderId})
         if firstRow then
             local ok = TryCharge(src, Player, firstRow.amount)
-            if ok then
-                MySQL.update.await('UPDATE afterpay_installments SET paid = 1, paid_at = NOW() WHERE id = ?', {firstRow.id})
-            else
+            if not ok then
                 MySQL.update.await('UPDATE afterpay_orders SET status = ? WHERE id = ?', {'cancelled', orderId})
                 MySQL.update.await('DELETE FROM afterpay_installments WHERE order_id = ?', {orderId})
                 MySQL.update.await('DELETE FROM afterpay_order_items WHERE order_id = ?', {orderId})
-                TriggerClientEvent('qb-afterpay:client:notify', src, 'Payment declined. Order cancelled.', 'error')
-                return
+                TriggerClientEvent('qb-afterpay:client:notify', src, 'Payment declined. Order cancelled.', 'error'); return
+            end
+            MySQL.update.await('UPDATE afterpay_installments SET paid = 1, paid_at = NOW() WHERE id = ?', {firstRow.id})
+            -- PER_INSTALLMENT merchant payout for first part
+            if Config.Merchant and Config.Merchant.Enabled and Config.Merchant.PayoutMode == 'PER_INSTALLMENT' then
+                PayBusiness(shopId, firstRow.amount, orderId, firstRow.id)
             end
         end
     end
@@ -225,31 +206,36 @@ RegisterNetEvent('qb-afterpay:server:checkout', function(data)
         end
     end
 
+    -- UPFRONT payout (business gets net immediately for full total)
+    if Config.Merchant and Config.Merchant.Enabled and Config.Merchant.PayoutMode == 'UPFRONT' then
+        PayBusiness(shopId, total, orderId, nil)
+    end
+
     TriggerClientEvent('qb-afterpay:client:notify', src, ('Afterpay set up! Total $%d over %d payments.'):format(total, plan.parts), 'success')
 end)
 
--- =========================
--- Manual pay (from UI)
--- =========================
+-- ===== Manual pay (from UI) =====
 RegisterNetEvent('qb-afterpay:server:payInstallment', function(installmentId)
     local src = source
     local Player = QBCore.Functions.GetPlayer(src)
     if not Player then return end
     local row = MySQL.single.await('SELECT i.*, o.status FROM afterpay_installments i JOIN afterpay_orders o ON o.id = i.order_id WHERE i.id = ?', {installmentId})
-    if not row then
-        TriggerClientEvent('qb-afterpay:client:notify', src, 'Installment not found', 'error'); return
-    end
-    if row.paid == 1 then
-        TriggerClientEvent('qb-afterpay:client:notify', src, 'Already paid', 'primary'); return
-    end
+    if not row then TriggerClientEvent('qb-afterpay:client:notify', src, 'Installment not found', 'error'); return end
+    if row.paid == 1 then TriggerClientEvent('qb-afterpay:client:notify', src, 'Already paid', 'primary'); return end
 
-    local amount = row.amount
-    local ok = TryCharge(src, Player, amount)
-    if not ok then
-        TriggerClientEvent('qb-afterpay:client:notify', src, 'Insufficient funds', 'error'); return
-    end
+    local ok = TryCharge(src, Player, row.amount)
+    if not ok then TriggerClientEvent('qb-afterpay:client:notify', src, 'Insufficient funds', 'error'); return end
 
     MySQL.update.await('UPDATE afterpay_installments SET paid = 1, paid_at = NOW() WHERE id = ?', {installmentId})
+
+    -- PER_INSTALLMENT merchant payout
+    if Config.Merchant and Config.Merchant.Enabled and Config.Merchant.PayoutMode == 'PER_INSTALLMENT' then
+        local inst = MySQL.single.await('SELECT i.id, i.amount, i.order_id, o.shop_id FROM afterpay_installments i JOIN afterpay_orders o ON o.id = i.order_id WHERE i.id = ?', {installmentId})
+        if inst and MerchantForShop(inst.shop_id) then
+            PayBusiness(inst.shop_id, inst.amount, inst.order_id, inst.id)
+        end
+    end
+
     local remaining = MySQL.scalar.await('SELECT COUNT(*) FROM afterpay_installments WHERE order_id = ? AND paid = 0', {row.order_id})
     if remaining == 0 then
         MySQL.update.await('UPDATE afterpay_orders SET status = ? WHERE id = ?', {'completed', row.order_id})
@@ -259,9 +245,7 @@ RegisterNetEvent('qb-afterpay:server:payInstallment', function(installmentId)
     end
 end)
 
--- =========================
--- Staff management
--- =========================
+-- ===== Staff management =====
 RegisterNetEvent('qb-afterpay:server:staff:addItem', function(data)
     local src = source
     if not data or not data.shop_id then return end
@@ -296,42 +280,114 @@ RegisterNetEvent('qb-afterpay:server:staff:removeItem', function(data)
     TriggerClientEvent('qb-afterpay:client:notify', src, 'Item removed', 'success')
 end)
 
--- =========================
--- Fuel Afterpay (x-fuel) callback
--- =========================
-QBCore.Functions.CreateCallback('qb-afterpay:fuel:checkout', function(src, cb, data)
-    -- data: { total, liters, price_per_liter, plan_id, plate, station_id }
-    if not (Config.Fuel and Config.Fuel.Enabled) then
-        cb(false, 'Afterpay for fuel is disabled'); return
+-- ===== Merchant: staff creates order for a customer =====
+RegisterNetEvent('qb-afterpay:server:merchant:createOrder', function(data)
+    local src = source
+    local Staff = QBCore.Functions.GetPlayer(src)
+    if not Staff then return end
+
+    local shopId = data.shop_id
+    if not PlayerHasShopAccess(src, shopId) then
+        TriggerClientEvent('qb-afterpay:client:notify', src, 'No access to this shop', 'error'); return
     end
 
-    local Player = QBCore.Functions.GetPlayer(src)
-    if not Player then cb(false, 'No player'); return end
+    local targetSrc = tonumber(data.target_src)
+    local Customer = targetSrc and QBCore.Functions.GetPlayer(targetSrc) or nil
+    if not Customer then
+        TriggerClientEvent('qb-afterpay:client:notify', src, 'Customer not found/nearby', 'error'); return
+    end
+
+    local planId = data.plan_id
+    local plan; for _,p in ipairs(Config.Plans) do if p.id == planId then plan = p break end end
+    if not plan then TriggerClientEvent('qb-afterpay:client:notify', src, 'Unknown plan', 'error'); return end
+
+    local items = data.items or {}
+    if #items == 0 then TriggerClientEvent('qb-afterpay:client:notify', src, 'No items added', 'error'); return end
+
+    local total = 0
+    for _,it in ipairs(items) do total = total + (tonumber(it.price) or 0) * (tonumber(it.qty) or 1) end
+    total = math.floor(total + 0.5)
+
+    local orderId = MySQL.insert.await('INSERT INTO afterpay_orders (citizenid, shop_id, plan_id, total, status) VALUES (?, ?, ?, ?, ?)', {
+        Customer.PlayerData.citizenid, shopId, planId, total, 'active'
+    })
+    if not orderId then TriggerClientEvent('qb-afterpay:client:notify', src, 'Order create failed', 'error'); return end
+
+    for _,it in ipairs(items) do
+        local qty = tonumber(it.qty) or 1
+        MySQL.insert.await('INSERT INTO afterpay_order_items (order_id, item_name, label, price, qty) VALUES (?, ?, ?, ?, ?)', {
+            orderId, it.name or 'custom', it.label or 'Item', tonumber(it.price) or 0, qty
+        })
+    end
+
+    local per = math.floor((total / plan.parts) + 0.5)
+    local remaining = total
+    local now = os.time()
+    local dueList = {}
+    local firstDue = (Config.Billing and Config.Billing.first_at_checkout == false) and nextAnchor(now) or now
+
+    for idx = 1, plan.parts do
+        local amount = (idx == plan.parts) and remaining or per
+        remaining = remaining - amount
+        local dueAt = (idx == 1) and firstDue or nextAnchor((dueList[#dueList] or firstDue) + 60)
+        MySQL.insert.await('INSERT INTO afterpay_installments (order_id, due_at, amount, paid) VALUES (?, FROM_UNIXTIME(?), ?, 0)', {
+            orderId, dueAt, amount
+        })
+        table.insert(dueList, dueAt)
+    end
+
+    if not (Config.Billing and Config.Billing.first_at_checkout == false) then
+        local firstRow = MySQL.single.await('SELECT * FROM afterpay_installments WHERE order_id = ? ORDER BY due_at ASC LIMIT 1', {orderId})
+        if firstRow then
+            local ok = (function()
+                for _,account in ipairs(Config.Accounts) do
+                    if Customer.Functions.RemoveMoney(account, firstRow.amount, 'afterpay-first-merchant') then
+                        TriggerClientEvent('qb-afterpay:client:notify', targetSrc, ('Charged $%d from %s.'):format(firstRow.amount, account), 'success')
+                        return true
+                    end
+                end
+                return false
+            end)()
+            if not ok then
+                MySQL.update.await('UPDATE afterpay_orders SET status = ? WHERE id = ?', {'cancelled', orderId})
+                MySQL.update.await('DELETE FROM afterpay_installments WHERE order_id = ?', {orderId})
+                MySQL.update.await('DELETE FROM afterpay_order_items WHERE order_id = ?', {orderId})
+                TriggerClientEvent('qb-afterpay:client:notify', src, 'Customer payment declined. Order cancelled.', 'error')
+                TriggerClientEvent('qb-afterpay:client:notify', targetSrc, 'Payment declined. Order cancelled.', 'error')
+                return
+            end
+            MySQL.update.await('UPDATE afterpay_installments SET paid = 1, paid_at = NOW() WHERE id = ?', {firstRow.id})
+            if Config.Merchant and Config.Merchant.Enabled and Config.Merchant.PayoutMode == 'PER_INSTALLMENT' then
+                PayBusiness(shopId, firstRow.amount, orderId, firstRow.id)
+            end
+        end
+    end
+
+    if Config.Merchant and Config.Merchant.Enabled and Config.Merchant.PayoutMode == 'UPFRONT' then
+        PayBusiness(shopId, total, orderId, nil)
+    end
+
+    TriggerClientEvent('qb-afterpay:client:notify', src, ('Created Afterpay order for customer: $%d over %d payments.'):format(total, plan.parts), 'success')
+    TriggerClientEvent('qb-afterpay:client:notify', targetSrc, ('Afterpay created: $%d over %d payments.'):format(total, plan.parts), 'success')
+end)
+
+-- ===== Fuel Afterpay (x-fuel) =====
+QBCore.Functions.CreateCallback('qb-afterpay:fuel:checkout', function(src, cb, data)
+    if not (Config.Fuel and Config.Fuel.Enabled) then cb(false, 'Afterpay for fuel is disabled'); return end
+    local Player = QBCore.Functions.GetPlayer(src); if not Player then cb(false, 'No player'); return end
 
     local planId = (data and data.plan_id) or (Config.Fuel.DefaultPlanId)
-    local plan = nil
-    for _,p in ipairs(Config.Plans) do if p.id == planId then plan = p break end end
+    local plan; for _,p in ipairs(Config.Plans) do if p.id == planId then plan = p break end end
     if not plan then cb(false, 'Unknown plan'); return end
 
     local total = tonumber(data and data.total) or 0
     local liters = tonumber(data and data.liters) or 0
     local ppl = tonumber(data and data.price_per_liter) or 0
-
-    if total <= 0 or liters <= 0 or ppl <= 0 then
-        cb(false, 'Invalid fuel data'); return
-    end
-
+    if total <= 0 or liters <= 0 or ppl <= 0 then cb(false, 'Invalid fuel data'); return end
     local recomputed = math.floor((liters * ppl) + 0.5)
-    if math.abs(recomputed - total) > 2 then
-        cb(false, 'Total mismatch'); return
-    end
-
-    if Config.Fuel.MinTotal and total < Config.Fuel.MinTotal then
-        cb(false, ('Min total is $%d'):format(Config.Fuel.MinTotal)); return
-    end
-    if Config.Fuel.MaxTotal and total > Config.Fuel.MaxTotal then
-        cb(false, ('Max total is $%d'):format(Config.Fuel.MaxTotal)); return
-    end
+    if math.abs(recomputed - total) > 2 then cb(false, 'Total mismatch'); return end
+    if Config.Fuel.MinTotal and total < Config.Fuel.MinTotal then cb(false, ('Min total is $%d'):format(Config.Fuel.MinTotal)); return end
+    if Config.Fuel.MaxTotal and total > Config.Fuel.MaxTotal then cb(false, ('Max total is $%d'):format(Config.Fuel.MaxTotal)); return end
 
     local orderId = MySQL.insert.await('INSERT INTO afterpay_orders (citizenid, shop_id, plan_id, total, status) VALUES (?, ?, ?, ?, ?)', {
         Player.PlayerData.citizenid, Config.Fuel.ShopId or 'fuel', planId, total, 'active'
@@ -347,28 +403,17 @@ QBCore.Functions.CreateCallback('qb-afterpay:fuel:checkout', function(src, cb, d
     local remaining = total
     local now = os.time()
     local dueList = {}
-
     local firstAtCheckout = Config.Billing and (Config.Billing.first_at_checkout ~= false)
     if Config.Fuel.RequireFirstAtCheckout then firstAtCheckout = true end
-
     local firstDue = firstAtCheckout and now or nextAnchor(now)
 
     for idx = 1, parts do
         local amount = (idx == parts) and remaining or per
         remaining = remaining - amount
-
-        local dueAt
-        if idx == 1 then
-            dueAt = firstDue
-        else
-            local prev = dueList[#dueList] or firstDue
-            dueAt = nextAnchor(prev + 60)
-        end
-
-        MySQL.insert.await(
-            'INSERT INTO afterpay_installments (order_id, due_at, amount, paid) VALUES (?, FROM_UNIXTIME(?), ?, 0)',
-            { orderId, dueAt, amount }
-        )
+        local dueAt = (idx == 1) and firstDue or nextAnchor((dueList[#dueList] or firstDue) + 60)
+        MySQL.insert.await('INSERT INTO afterpay_installments (order_id, due_at, amount, paid) VALUES (?, FROM_UNIXTIME(?), ?, 0)', {
+            orderId, dueAt, amount
+        })
         table.insert(dueList, dueAt)
     end
 
@@ -391,16 +436,21 @@ QBCore.Functions.CreateCallback('qb-afterpay:fuel:checkout', function(src, cb, d
                 cb(false, 'Insufficient funds for first installment'); return
             end
             MySQL.update.await('UPDATE afterpay_installments SET paid = 1, paid_at = NOW() WHERE id = ?', {firstRow.id})
+            if Config.Merchant and Config.Merchant.Enabled and Config.Merchant.PayoutMode == 'PER_INSTALLMENT' then
+                PayBusiness(Config.Fuel.ShopId or 'fuel', firstRow.amount, orderId, firstRow.id)
+            end
         end
+    end
+
+    if Config.Merchant and Config.Merchant.Enabled and Config.Merchant.PayoutMode == 'UPFRONT' then
+        PayBusiness(Config.Fuel.ShopId or 'fuel', total, orderId, nil)
     end
 
     TriggerClientEvent('qb-afterpay:client:notify', src, ('Afterpay set up for fuel: $%d over %d payments.'):format(total, parts), 'success')
     cb(true)
 end)
 
--- =========================
--- OFFLINE charging + Late fee
--- =========================
+-- ===== OFFLINE charging + Late fee =====
 local function computeLateFee(amount)
     local p = Config.LateFeePolicy or {}
     if (p.type == 'percent') then
@@ -413,18 +463,12 @@ local function computeLateFee(amount)
     end
 end
 
--- Remove money when player is OFFLINE
 local function OfflineRemoveMoney(citizenid, account, amount)
     local mode = Config.OfflineCharging and Config.OfflineCharging.Mode or 'QB_PLAYERS'
     if mode == 'QB_BANKING' then
-        -- Example banking schema (adjust to your server):
-        -- local bal = MySQL.scalar.await('SELECT balance FROM bank_accounts WHERE citizenid = ? AND account_type = "personal" LIMIT 1', { citizenid })
-        -- if not bal or bal < amount then return false end
-        -- local ok = MySQL.update.await('UPDATE bank_accounts SET balance = balance - ? WHERE citizenid = ? AND account_type = "personal"', { amount, citizenid })
-        -- return ok and ok > 0
-        return false -- change to true implementation if you use banking table
+        -- Adjust to your banking schema if you use one
+        return false
     else
-        -- Default QBCore players table JSON money
         local row = MySQL.single.await('SELECT money FROM players WHERE citizenid = ? LIMIT 1', { citizenid })
         if not row or not row.money then return false end
         local ok, money = pcall(function() return json.decode(row.money) end)
@@ -438,9 +482,7 @@ local function OfflineRemoveMoney(citizenid, account, amount)
     end
 end
 
--- Attempt charge for a given installment (ONLINE or OFFLINE)
 local function AttemptChargeForInstallment(inst)
-    -- inst: { id, amount, order_id, citizenid }
     local Player = QBCore.Functions.GetPlayerByCitizenId(inst.citizenid)
     local success = false
     if Player then
@@ -452,6 +494,13 @@ local function AttemptChargeForInstallment(inst)
 
     if success then
         MySQL.update.await('UPDATE afterpay_installments SET paid = 1, paid_at = NOW(), attempts = COALESCE(attempts,0)+1, last_attempt_at = NOW() WHERE id = ?', {inst.id})
+        -- PER_INSTALLMENT merchant payout
+        if Config.Merchant and Config.Merchant.Enabled and Config.Merchant.PayoutMode == 'PER_INSTALLMENT' then
+            local shopId = MySQL.scalar.await('SELECT shop_id FROM afterpay_orders WHERE id = ?', {inst.order_id})
+            if shopId and MerchantForShop(shopId) then
+                PayBusiness(shopId, inst.amount, inst.order_id, inst.id)
+            end
+        end
         local remaining = MySQL.scalar.await('SELECT COUNT(*) FROM afterpay_installments WHERE order_id = ? AND paid = 0', {inst.order_id})
         if remaining and tonumber(remaining) == 0 then
             MySQL.update.await('UPDATE afterpay_orders SET status = "completed" WHERE id = ?', {inst.order_id})
@@ -470,9 +519,6 @@ local function AttemptChargeForInstallment(inst)
     end
 end
 
--- =========================
--- Unified auto-charge loop (ONLINE & OFFLINE)
--- =========================
 CreateThread(function()
     while true do
         local rows = MySQL.query.await([[
